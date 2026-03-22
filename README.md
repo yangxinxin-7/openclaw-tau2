@@ -19,6 +19,22 @@ TAU-2 编排器
                   └─ 火山引擎 ARK 模型
 ```
 
+## OpenClaw 已知 Bug（需手动修复）
+
+当前版本的 OpenClaw 存在一个 bug：通过 `/v1/responses` 传入的 `clientTools` 在内部调用链中丢失，导致 client-side function tools 无法正常工作。
+
+**根本原因**：`runEmbeddedPiAgent` 调用 `runEmbeddedAttempt` 时漏传了 `clientTools` 参数（[PR #49695](https://github.com/openclaw/openclaw/pull/49695)）。
+
+**临时修复方法**：在 `/opt/homebrew/lib/node_modules/openclaw/dist/auth-profiles-*.js` 中找到 `runEmbeddedAttempt` 的调用处，在参数列表里补上一行：
+
+```js
+images: params.images,
+clientTools: params.clientTools,   // ← 补上这行
+disableTools: params.disableTools,
+```
+
+PR 合并后无需手动修复。
+
 ## 环境准备
 
 ### 依赖
