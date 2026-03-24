@@ -3,5 +3,12 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+*.egg-info/
+.DS_Store
+.idea/
+
+# TAU-2 large data files (benchmark results & trajectories)
 tau2-bench/data/tau2/simulations/
 tau2-bench/data/simulations/
+tau2-bench/data/tau2/results/
+tau2-bench/web/leaderboard/public/submissions/

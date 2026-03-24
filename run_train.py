@@ -21,33 +21,53 @@ import os
 import pathlib
 import sys
 import uuid
+from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "tau2-bench", "src"))
 
 from run_eval import get_ark_env, setup_env
 
-SESSIONS_DIR = pathlib.Path.home() / ".openclaw" / "agents" / "main" / "sessions"
-MEMORY_DIR = pathlib.Path.home() / ".openclaw" / "workspace" / "memory"
+OPENCLAW_AGENTS_DIR = pathlib.Path.home() / ".openclaw" / "agents"
+OPENCLAW_WORKSPACE_DIR = pathlib.Path.home() / ".openclaw" / "workspace"
 
 
-def clear_sessions():
-    files = list(SESSIONS_DIR.glob("*.jsonl"))
+def _agent_dirs(agent_id: str = None):
+    """Return (sessions_dir, sessions_json, memory_dir) for the given agent."""
+    aid = agent_id or "main"
+    sessions_dir = OPENCLAW_AGENTS_DIR / aid / "sessions"
+    sessions_json = sessions_dir / "sessions.json"
+    if agent_id:
+        memory_dir = OPENCLAW_WORKSPACE_DIR / agent_id / "memory"
+    else:
+        memory_dir = OPENCLAW_WORKSPACE_DIR / "memory"
+    return sessions_dir, sessions_json, memory_dir
+
+
+def clear_sessions(agent_id: str = None):
+    sessions_dir, sessions_json, memory_dir = _agent_dirs(agent_id)
+
+    files = list(sessions_dir.glob("*.jsonl")) if sessions_dir.exists() else []
     for f in files:
         f.unlink()
-    print(f"[Train] Cleared {len(files)} session files from {SESSIONS_DIR}")
+    print(f"[Train] Cleared {len(files)} session files from {sessions_dir}")
 
-    mem_files = list(MEMORY_DIR.glob("*")) if MEMORY_DIR.exists() else []
+    if sessions_json.exists():
+        sessions_json.unlink()
+        print(f"[Train] Cleared sessions.json from {sessions_json}")
+
+    mem_files = list(memory_dir.glob("*")) if memory_dir.exists() else []
     for f in mem_files:
         if f.is_file():
             f.unlink()
-    print(f"[Train] Cleared {len(mem_files)} memory files from {MEMORY_DIR}")
+    print(f"[Train] Cleared {len(mem_files)} memory files from {memory_dir}")
 
 
-def count_session_tokens() -> dict:
+def count_session_tokens(agent_id: str = None) -> dict:
+    sessions_dir, _, _ = _agent_dirs(agent_id)
     total_input = 0
     total_output = 0
     total_tokens = 0
-    for path in SESSIONS_DIR.glob("*.jsonl"):
+    for path in sessions_dir.glob("*.jsonl") if sessions_dir.exists() else []:
         with open(path) as f:
             for line in f:
                 try:
@@ -102,19 +122,19 @@ def format_reward_feedback(reward_info) -> str:
     return "\n".join(lines)
 
 
-def make_agent_class(session_id: str, use_gateway: bool = False):
+def make_agent_class(session_id: str, use_gateway: bool = False, agent_id: str = None):
     """OpenClawAgent pinned to a specific session_id (seeds on first call)."""
     from openclaw_agent import OpenClawAgent, OpenClawAgentState
 
     class PinnedSessionAgent(OpenClawAgent):
         def __init__(self, tools, domain_policy):
-            super().__init__(tools=tools, domain_policy=domain_policy, use_gateway=use_gateway)
+            super().__init__(tools=tools, domain_policy=domain_policy, use_gateway=use_gateway, agent_id=agent_id)
 
         def get_init_state(self, message_history=None):
             from openclaw_agent import _call_openclaw
             try:
                 seed_msg = f"[SYSTEM CONTEXT]\n{self._system_prompt}"
-                _call_openclaw(session_id, seed_msg, use_gateway=self._use_gateway)
+                _call_openclaw(session_id, seed_msg, use_gateway=self._use_gateway, agent_id=self._agent_id)
                 print(f"  [OpenClaw] session: {session_id}")
             except Exception as e:
                 print(f"  [OpenClaw] warn: seed failed: {e}")
@@ -162,9 +182,10 @@ def main():
     parser = argparse.ArgumentParser(description="Train OpenClaw memory on TAU-2 train split")
     parser.add_argument("--domain", default="mock", choices=["mock", "airline", "retail", "telecom"])
     parser.add_argument("--num-tasks", type=int, default=None)
-    parser.add_argument("--max-steps", type=int, default=30)
+    parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--use-gateway", action="store_true")
     parser.add_argument("--save-to", type=str, default=None)
+    parser.add_argument("--force", action="store_true", help="Ignore checkpoint and restart from scratch")
     args = parser.parse_args()
 
     from loguru import logger
@@ -176,34 +197,51 @@ def main():
     user_llm = default_model
     use_gateway = args.use_gateway
 
-    from openclaw_agent import _call_openclaw
+    from openclaw_agent import _call_openclaw, DOMAIN_AGENT_MAP
     from tau2.registry import registry
     from tau2.run import get_tasks
 
-    clear_sessions()
-
+    agent_id = DOMAIN_AGENT_MAP.get(args.domain)
     split = "train" if args.domain != "mock" else "base"
-    tasks = get_tasks(args.domain, task_split_name=split, num_tasks=args.num_tasks)
-    print(f"[Train] domain={args.domain}  split={split}  tasks={len(tasks)}")
-    print()
+
+    # --- Checkpoint setup ---
+    save_to = args.save_to or f"train_{args.domain}_{split}"
+    out_dir = pathlib.Path(__file__).parent / "tau2-bench" / "data" / "tau2" / "simulations"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{save_to}.json"
 
     results = []
-    for i, task in enumerate(tasks):
-        print(f"[{i+1}/{len(tasks)}] Task: {task.id}")
+    completed_ids = set()
+    if not args.force and out_path.exists():
+        with open(out_path) as f:
+            checkpoint = json.load(f)
+        results = checkpoint.get("tasks", [])
+        completed_ids = {r["task_id"] for r in results}
+        print(f"[Train] Resuming from checkpoint: {len(completed_ids)} tasks already done")
+    else:
+        clear_sessions(agent_id)
+
+    tasks = get_tasks(args.domain, task_split_name=split, num_tasks=args.num_tasks)
+    pending = [t for t in tasks if t.id not in completed_ids]
+    print(f"[Train] domain={args.domain}  split={split}  total={len(tasks)}  pending={len(pending)}")
+    print()
+
+    for i, task in enumerate(pending):
+        print(f"[{i+1}/{len(pending)}] Task: {task.id}")
 
         session_id = f"tau2-{uuid.uuid4().hex[:12]}"
 
-        # --- Run 1: blind ---
-        print("  Run 1 (blind)...")
-        registry._agents.pop("openclaw_run1", None)
-        registry.register_agent(make_agent_class(session_id, use_gateway), "openclaw_run1")
-        sim1, reward1 = run_one_task(args.domain, task, "openclaw_run1", user_llm, model_id, args.max_steps)
-        success1 = reward1 >= 1.0
-        print(f"  Run 1: {'SUCCESS' if success1 else 'FAIL'}  (reward={reward1:.2f})")
+        try:
+            tokens_before = count_session_tokens(agent_id)
+            registry._agents.pop("openclaw_run1", None)
+            registry.register_agent(make_agent_class(session_id, use_gateway, agent_id), "openclaw_run1")
+            sim1, reward1 = run_one_task(args.domain, task, "openclaw_run1", user_llm, model_id, args.max_steps)
+            success1 = reward1 >= 1.0
+            print(f"  Run 1: {'SUCCESS' if success1 else 'FAIL'}  (reward={reward1:.2f})")
 
-        # Skip Run 2 if already succeeded, but still send success feedback
-        if success1:
-            parts = [f"The task has ended. Your attempt succeeded (reward={reward1:.2f})."]
+            # --- Send feedback into the same session ---
+            result_str = f"The task has ended. Your attempt {'succeeded' if success1 else 'failed'} (reward={reward1:.2f})."
+            parts = [result_str]
             feedback_str = format_reward_feedback(sim1.reward_info)
             if feedback_str:
                 parts.append(feedback_str)
@@ -211,96 +249,54 @@ def main():
             if gt_str:
                 parts.append(gt_str)
             feedback_message = "\n".join(parts)
+
+            now = datetime.now()
+            # LanceDB vector memory: agent uses memory_store/memory_recall/memory_forget to manage long-term memory.
+            remember_str = (
+                f"[REMEMBER] The time is {now.strftime('%Y-%m-%d %H:%M:%S')}. "
+                f"Use your memory tools to save what you think is important: "
+                f"memory_store to save a new memory, "
+                f"memory_recall to search existing memories, "
+                f"memory_forget to remove outdated ones."
+            )
+            full_message = f"[EVALUATION RESULT]\n{feedback_message}\n\n\n{remember_str}"
             print(f"  [feedback → session {session_id}]\n    " + feedback_message.replace("\n", "\n    "))
-            _call_openclaw(session_id, f"[EVALUATION RESULT]\n{feedback_message}", use_gateway=use_gateway)
-            _call_openclaw(session_id, "Remember what's said, keep existing memory.", use_gateway=use_gateway)
-            print("  Run 2: skipped (succeeded)")
+            _call_openclaw(session_id, full_message, use_gateway=use_gateway, agent_id=agent_id)
             print()
+
+            tokens_after = count_session_tokens(agent_id)
+            task_tokens = {
+                "input": tokens_after["input"] - tokens_before["input"],
+                "output": tokens_after["output"] - tokens_before["output"],
+                "totalTokens": tokens_after["totalTokens"] - tokens_before["totalTokens"],
+            }
             results.append({
                 "task_id": task.id,
                 "run1_reward": reward1,
                 "run1_success": success1,
-                "run2_reward": None,
-                "run2_success": None,
+                "tokens": task_tokens,
             })
-            continue
+        except Exception as e:
+            print(f"  [ERROR] Task {task.id} failed, skipping: {e}")
 
-        # --- Send feedback into the same session ---
-        result_str = f"The task has ended. Your attempt failed (reward={reward1:.2f})."
-        parts = [result_str]
-        feedback_str = format_reward_feedback(sim1.reward_info)
-        if feedback_str:
-            parts.append(feedback_str)
-        gt_str = format_ground_truth(task)
-        if gt_str:
-            parts.append(gt_str)
-        parts.append("A new customer session will start shortly.")
-        feedback_message = "\n".join(parts)
-
-        print(f"  [feedback → session {session_id}]\n    " + feedback_message.replace("\n", "\n    "))
-        _call_openclaw(session_id, f"[EVALUATION RESULT]\n{feedback_message}", use_gateway=use_gateway)
-
-        # Reset agent to wait mode before Run 2 starts
-        _call_openclaw(session_id, "[SYSTEM] A new customer session is starting. Wait for the customer to speak first.", use_gateway=use_gateway)
-
-        # --- Run 2: reuse same session ---
-        print("  Run 2 (same session, with feedback)...")
-        registry._agents.pop("openclaw_run2", None)
-        registry.register_agent(make_reuse_agent_class(session_id, use_gateway), "openclaw_run2")
-        sim2, reward2 = run_one_task(args.domain, task, "openclaw_run2", user_llm, model_id, args.max_steps)
-        success2 = reward2 >= 1.0
-        print(f"  Run 2: {'SUCCESS' if success2 else 'FAIL'}  (reward={reward2:.2f})")
-
-        # Send Run 2 result feedback
-        run2_result = f"The task has ended. Your attempt {'succeeded' if success2 else 'failed'} (reward={reward2:.2f})."
-        run2_parts = [run2_result]
-        run2_feedback = format_reward_feedback(sim2.reward_info)
-        if run2_feedback:
-            run2_parts.append(run2_feedback)
-        run2_gt = format_ground_truth(task)
-        if run2_gt:
-            run2_parts.append(run2_gt)
-        _call_openclaw(session_id, f"[EVALUATION RESULT]\n" + "\n".join(run2_parts), use_gateway=use_gateway)
-        _call_openclaw(session_id, "Remember what's said, keep existing memory.", use_gateway=use_gateway)
-        print()
-
-        results.append({
-            "task_id": task.id,
-            "run1_reward": reward1,
-            "run1_success": success1,
-            "run2_reward": reward2,
-            "run2_success": success2,
-        })
+        # Save checkpoint after every task
+        with open(out_path, "w") as f:
+            json.dump({"domain": args.domain, "split": split, "tasks": results}, f, indent=2, ensure_ascii=False)
 
     # --- Summary ---
     n = len(results)
-    r2_results = [r for r in results if r["run2_reward"] is not None]
     r1_avg = sum(r["run1_reward"] for r in results) / n
     r1_pass = sum(r["run1_success"] for r in results) / n
 
     print("=" * 50)
     print(f"[Train Summary]  {n} tasks  domain={args.domain}  split={split}")
-    print(f"  Run 1 (blind):         avg_reward={r1_avg:.3f}  pass_rate={r1_pass:.3f}")
-    if r2_results:
-        r2_avg = sum(r["run2_reward"] for r in r2_results) / len(r2_results)
-        r2_pass = sum(r["run2_success"] for r in r2_results) / len(r2_results)
-        print(f"  Run 2 (w/ feedback):   avg_reward={r2_avg:.3f}  pass_rate={r2_pass:.3f}  ({len(r2_results)}/{n} tasks)")
+    print(f"  avg_reward={r1_avg:.3f}  pass_rate={r1_pass:.3f}")
     print()
-    token_stats = count_session_tokens()
+    token_stats = count_session_tokens(agent_id)
     print(f"  Token usage (accumulated):  input={token_stats['input']:,}  output={token_stats['output']:,}  total={token_stats['totalTokens']:,}")
     print()
     print("Memory accumulated. Now run:")
     print(f"  python run_eval.py --domain {args.domain} --task-split test")
-
-    save_to = args.save_to or f"train_{args.domain}_{split}"
-    out_dir = pathlib.Path(__file__).parent / "tau2-bench" / "data" / "tau2" / "simulations"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{save_to}.json"
-    with open(out_path, "w") as f:
-        json.dump(
-            {"domain": args.domain, "split": split, "tasks": results},
-            f, indent=2, ensure_ascii=False,
-        )
     print(f"Results saved to {out_path}")
 
 
