@@ -272,8 +272,8 @@ def main():
     parser.add_argument("--save-to", type=str, default=None)
     parser.add_argument("--force", action="store_true", help="Ignore checkpoint and restart from scratch")
     parser.add_argument(
-        "--memory-backend", choices=["lancedb", "openviking"], default="openviking",
-        help="Memory backend: lancedb (default) or openviking",
+        "--memory-backend", choices=["memory-core", "lancedb", "openviking"], default="memory-core",
+        help="Memory backend: memory-core (default), lancedb, or openviking",
     )
     parser.add_argument(
         "--num-runs", type=int, default=None,
@@ -351,7 +351,7 @@ def main():
                 })
                 print(f"  avg_reward={avg_reward:.2f}  pass_rate={results[-1]['pass_rate']:.2f}")
             else:
-                # --- LanceDB mode (default): single run + feedback to OpenClaw session ---
+                # --- memory-core / LanceDB mode: single run + feedback to OpenClaw session ---
                 session_id = f"tau2-{uuid.uuid4().hex[:12]}"
                 tokens_before = count_session_tokens(agent_id)
                 registry._agents.pop("openclaw_run1", None)

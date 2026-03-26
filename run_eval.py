@@ -75,9 +75,9 @@ def parse_args():
                         help="Overwrite existing results file instead of resuming.")
     parser.add_argument(
         "--memory-backend",
-        choices=["lancedb", "openviking"],
-        default="lancedb",
-        help="Memory backend for eval. openviking prepends retrieved ov memories to the first user message.",
+        choices=["memory-core", "lancedb", "openviking"],
+        default="memory-core",
+        help="Memory backend for eval. memory-core is the default; openviking prepends retrieved ov memories to the first user message.",
     )
     return parser.parse_args()
 
