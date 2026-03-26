@@ -69,10 +69,16 @@ def parse_args():
     )
     parser.add_argument("--save-to", type=str, default=None, help="Results file name (default: openclaw_<domain>)")
     parser.add_argument("--max-steps", type=int, default=30, help="Max steps per task (default: 30)")
-    parser.add_argument("--use-gateway", action="store_true",
-                        help="Route through OpenClaw gateway (run `openclaw gateway` first). Sessions visible in dashboard.")
+    parser.add_argument("--no-gateway", action="store_false", dest="use_gateway", default=True,
+                        help="Disable gateway routing and run agent locally.")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing results file instead of resuming.")
+    parser.add_argument(
+        "--memory-backend",
+        choices=["lancedb", "openviking"],
+        default="lancedb",
+        help="Memory backend for eval. openviking prepends retrieved ov memories to the first user message.",
+    )
     return parser.parse_args()
 
 
@@ -100,23 +106,32 @@ def main():
     print(f"  Num tasks  : {args.num_tasks or 'all'}")
     print(f"  Num trials : {args.num_trials}")
     print(f"  User LLM   : {user_llm}")
+    print(f"  Memory     : {args.memory_backend}")
     if task_ids:
         print(f"  Task IDs   : {task_ids}")
     print()
 
     # Import after env setup
-    from openclaw_agent import OpenClawAgent
+    from openclaw_agent import OpenClawAgent, DOMAIN_AGENT_MAP
     from tau2.registry import registry
     from tau2.run import run_domain
     from tau2.data_model.simulation import RunConfig
 
-    # Register OpenClaw agent
+    # Register OpenClaw agent with per-domain agent_id for memory isolation
     use_gateway = args.use_gateway
+    agent_id = DOMAIN_AGENT_MAP.get(args.domain)
     session_ids = []
+    prepend_openviking_memory = args.memory_backend == "openviking"
     registry.register_agent(
         type("OpenClawAgentConfigured", (OpenClawAgent,), {
             "__init__": lambda self, tools, domain_policy: OpenClawAgent.__init__(
-                self, tools=tools, domain_policy=domain_policy, use_gateway=use_gateway, session_collector=session_ids
+                self,
+                tools=tools,
+                domain_policy=domain_policy,
+                use_gateway=use_gateway,
+                session_collector=session_ids,
+                agent_id=agent_id,
+                prepend_openviking_memory=prepend_openviking_memory,
             )
         }),
         "openclaw",
@@ -150,6 +165,11 @@ def main():
             print(f"\nSessions ({len(session_ids)}):")
             for sid in session_ids:
                 print(f"  {sid}")
+
+            from count_tokens import count_tokens
+            print(f"\nToken usage:")
+            stats = count_tokens(session_ids, domain=args.domain if agent_id else None)
+            print(f"  input={stats['input']:,}  output={stats['output']:,}  total={stats['totalTokens']:,}")
 
 
 if __name__ == "__main__":

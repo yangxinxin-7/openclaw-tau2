@@ -9,9 +9,22 @@ For each train task:
 After training, evaluate with:
     python run_eval.py --domain <domain> --task-split test
 
+Memory backends
+---------------
+lancedb (default):
+    OpenClaw's built-in LanceDB plugin. Agent manually stores/recalls memories
+    via memory_store/memory_recall tools in each session.
+
+openviking:
+    OpenViking context database. Each task is run --num-runs times (default 5).
+    After every run the full conversation + evaluation result is committed to
+    OpenViking, which automatically extracts structured memories (cases, patterns,
+    events, …) via LLM. Requires OpenViking to be installed and configured.
+
 Usage:
     python run_train.py --domain retail
     python run_train.py --domain airline --num-tasks 5
+    python run_train.py --domain airline --memory-backend openviking --num-runs 5
 """
 
 import argparse
@@ -122,7 +135,7 @@ def format_reward_feedback(reward_info) -> str:
     return "\n".join(lines)
 
 
-def make_agent_class(session_id: str, use_gateway: bool = False, agent_id: str = None):
+def make_agent_class(session_id: str, use_gateway: bool = True, agent_id: str = None):
     """OpenClawAgent pinned to a specific session_id (seeds on first call)."""
     from openclaw_agent import OpenClawAgent, OpenClawAgentState
 
@@ -131,19 +144,13 @@ def make_agent_class(session_id: str, use_gateway: bool = False, agent_id: str =
             super().__init__(tools=tools, domain_policy=domain_policy, use_gateway=use_gateway, agent_id=agent_id)
 
         def get_init_state(self, message_history=None):
-            from openclaw_agent import _call_openclaw
-            try:
-                seed_msg = f"[SYSTEM CONTEXT]\n{self._system_prompt}"
-                _call_openclaw(session_id, seed_msg, use_gateway=self._use_gateway, agent_id=self._agent_id)
-                print(f"  [OpenClaw] session: {session_id}")
-            except Exception as e:
-                print(f"  [OpenClaw] warn: seed failed: {e}")
+            print(f"  [OpenClaw] session: {session_id}")
             return OpenClawAgentState(session_id=session_id)
 
     return PinnedSessionAgent
 
 
-def make_reuse_agent_class(session_id: str, use_gateway: bool = False):
+def make_reuse_agent_class(session_id: str, use_gateway: bool = True):
     """OpenClawAgent that reuses an existing session without re-seeding."""
     from openclaw_agent import OpenClawAgent, OpenClawAgentState
 
@@ -178,14 +185,100 @@ def run_one_task(domain, task, agent_name, user_llm, model_id, max_steps):
     return sim, reward
 
 
+def commit_to_openviking(domain: str, task, run_idx: int, sim, reward: float, reward_info) -> None:
+    """Submit a TAU-2 task run to OpenViking via `ov add-memory` (one-shot: create+add+commit)."""
+    import subprocess
+
+    messages = []
+    task_id = getattr(task, "id", None) or "unknown"
+
+    try:
+        from tau2.run import get_environment_info
+        env_info = get_environment_info(domain_name=domain, include_tool_info=False)
+        domain_policy = env_info.policy
+        from openclaw_agent import _build_system_prompt
+        sys_prompt = _build_system_prompt(domain_policy)
+        messages.append({"role": "user", "content": f"system:\n{sys_prompt}"})
+    except Exception:
+        pass
+
+    tool_calls_by_id = {}
+    for msg in sim.messages:
+        role = getattr(msg, "role", None)
+        if str(role) in ("user", "assistant"):
+            content = getattr(msg, "content", None)
+            if isinstance(content, str) and content.strip():
+                messages.append({"role": str(role), "content": f"{role}:\n{content}"})
+            tcs = getattr(msg, "tool_calls", None)
+            if tcs:
+                for tc in tcs:
+                    tc_id = getattr(tc, "id", "") or ""
+                    tc_role = getattr(tc, "requestor", str(role)) or str(role)
+                    tc_name = getattr(tc, "name", "") or ""
+                    tc_args = getattr(tc, "arguments", {}) or {}
+                    tool_calls_by_id[tc_id] = tc
+                    messages.append({
+                        "role": str(tc_role),
+                        "content": "tool-call:\n"
+                        + (f"call_id: {tc_id}\n" if tc_id else "")
+                        + f"name: {tc_name}\n"
+                        + "arguments: "
+                        + json.dumps(tc_args, ensure_ascii=False),
+                    })
+        elif str(role) == "tool":
+            tool_call_id = getattr(msg, "id", "") or ""
+            requestor = getattr(msg, "requestor", "assistant") or "assistant"
+            tc = tool_calls_by_id.get(tool_call_id)
+            tool_name = getattr(tc, "name", "") if tc is not None else ""
+            output = getattr(msg, "content", None)
+            output_str = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+            error = getattr(msg, "error", False)
+            messages.append({
+                "role": str(requestor),
+                "content": "tool-response:\n"
+                + (f"call_id: {tool_call_id}\n" if tool_call_id else "")
+                + (f"name: {tool_name}\n" if tool_name else "")
+                + (f"error: {bool(error)}\n" if error else "")
+                + f"output: {output_str}",
+            })
+
+    # Append evaluation result so OpenViking has outcome context for memory extraction
+    success = reward >= 1.0
+    result_lines = [f"[EVALUATION] success={success} failed={not success} reward={reward:.2f}"]
+    feedback = format_reward_feedback(reward_info)
+    if feedback:
+        result_lines.append(feedback)
+    if not success:
+        gt_str = format_ground_truth(task)
+        if gt_str:
+            result_lines.append(gt_str)
+    messages.append({"role": "user", "content": "\n".join(result_lines)})
+
+    content_arg = json.dumps(messages, ensure_ascii=False)
+    result = subprocess.run(
+        ["ov", "add-memory", content_arg],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ov add-memory failed: {result.stderr.strip()}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train OpenClaw memory on TAU-2 train split")
     parser.add_argument("--domain", default="mock", choices=["mock", "airline", "retail", "telecom"])
     parser.add_argument("--num-tasks", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=100)
-    parser.add_argument("--use-gateway", action="store_true")
+    parser.add_argument("--no-gateway", action="store_false", dest="use_gateway", default=True)
     parser.add_argument("--save-to", type=str, default=None)
     parser.add_argument("--force", action="store_true", help="Ignore checkpoint and restart from scratch")
+    parser.add_argument(
+        "--memory-backend", choices=["lancedb", "openviking"], default="openviking",
+        help="Memory backend: lancedb (default) or openviking",
+    )
+    parser.add_argument(
+        "--num-runs", type=int, default=None,
+        help="Runs per task for openviking backend (default: 5)",
+    )
     args = parser.parse_args()
 
     from loguru import logger
@@ -201,8 +294,13 @@ def main():
     from tau2.registry import registry
     from tau2.run import get_tasks
 
+    use_openviking = args.memory_backend == "openviking"
+    num_runs = args.num_runs or (1 if use_openviking else 1)
     agent_id = DOMAIN_AGENT_MAP.get(args.domain)
     split = "train" if args.domain != "mock" else "base"
+
+    if use_openviking:
+        print(f"[Train] OpenViking backend  runs_per_task={num_runs}")
 
     # --- Checkpoint setup ---
     save_to = args.save_to or f"train_{args.domain}_{split}"
@@ -229,53 +327,75 @@ def main():
     for i, task in enumerate(pending):
         print(f"[{i+1}/{len(pending)}] Task: {task.id}")
 
-        session_id = f"tau2-{uuid.uuid4().hex[:12]}"
-
         try:
-            tokens_before = count_session_tokens(agent_id)
-            registry._agents.pop("openclaw_run1", None)
-            registry.register_agent(make_agent_class(session_id, use_gateway, agent_id), "openclaw_run1")
-            sim1, reward1 = run_one_task(args.domain, task, "openclaw_run1", user_llm, model_id, args.max_steps)
-            success1 = reward1 >= 1.0
-            print(f"  Run 1: {'SUCCESS' if success1 else 'FAIL'}  (reward={reward1:.2f})")
+            if use_openviking:
+                # --- OpenViking mode: repeat each task num_runs times ---
+                run_rewards = []
+                for run_idx in range(1, num_runs + 1):
+                    session_id = f"tau2-{uuid.uuid4().hex[:12]}"
+                    registry._agents.pop("openclaw_run", None)
+                    registry.register_agent(make_agent_class(session_id, use_gateway, agent_id), "openclaw_run")
+                    sim, reward = run_one_task(args.domain, task, "openclaw_run", user_llm, model_id, args.max_steps)
+                    run_rewards.append(reward)
+                    print(f"  Run {run_idx}/{num_runs}: {'SUCCESS' if reward >= 1.0 else 'FAIL'}  (reward={reward:.2f})")
 
-            # --- Send feedback into the same session ---
-            result_str = f"The task has ended. Your attempt {'succeeded' if success1 else 'failed'} (reward={reward1:.2f})."
-            parts = [result_str]
-            feedback_str = format_reward_feedback(sim1.reward_info)
-            if feedback_str:
-                parts.append(feedback_str)
-            gt_str = format_ground_truth(task)
-            if gt_str:
-                parts.append(gt_str)
-            feedback_message = "\n".join(parts)
+                    commit_to_openviking(args.domain, task, run_idx, sim, reward, sim.reward_info)
+                    print(f"    → OpenViking commit done")
 
-            now = datetime.now()
-            # LanceDB vector memory: agent uses memory_store/memory_recall/memory_forget to manage long-term memory.
-            remember_str = (
-                f"[REMEMBER] The time is {now.strftime('%Y-%m-%d %H:%M:%S')}. "
-                f"Use your memory tools to save what you think is important: "
-                f"memory_store to save a new memory, "
-                f"memory_recall to search existing memories, "
-                f"memory_forget to remove outdated ones."
-            )
-            full_message = f"[EVALUATION RESULT]\n{feedback_message}\n\n\n{remember_str}"
-            print(f"  [feedback → session {session_id}]\n    " + feedback_message.replace("\n", "\n    "))
-            _call_openclaw(session_id, full_message, use_gateway=use_gateway, agent_id=agent_id)
-            print()
+                avg_reward = sum(run_rewards) / len(run_rewards)
+                results.append({
+                    "task_id": task.id,
+                    "run_rewards": run_rewards,
+                    "avg_reward": avg_reward,
+                    "pass_rate": sum(r >= 1.0 for r in run_rewards) / len(run_rewards),
+                })
+                print(f"  avg_reward={avg_reward:.2f}  pass_rate={results[-1]['pass_rate']:.2f}")
+            else:
+                # --- LanceDB mode (default): single run + feedback to OpenClaw session ---
+                session_id = f"tau2-{uuid.uuid4().hex[:12]}"
+                tokens_before = count_session_tokens(agent_id)
+                registry._agents.pop("openclaw_run1", None)
+                registry.register_agent(make_agent_class(session_id, use_gateway, agent_id), "openclaw_run1")
+                sim1, reward1 = run_one_task(args.domain, task, "openclaw_run1", user_llm, model_id, args.max_steps)
+                success1 = reward1 >= 1.0
+                print(f"  Run 1: {'SUCCESS' if success1 else 'FAIL'}  (reward={reward1:.2f})")
 
-            tokens_after = count_session_tokens(agent_id)
-            task_tokens = {
-                "input": tokens_after["input"] - tokens_before["input"],
-                "output": tokens_after["output"] - tokens_before["output"],
-                "totalTokens": tokens_after["totalTokens"] - tokens_before["totalTokens"],
-            }
-            results.append({
-                "task_id": task.id,
-                "run1_reward": reward1,
-                "run1_success": success1,
-                "tokens": task_tokens,
-            })
+                # Send feedback into the same session
+                result_str = f"The task has ended. Your attempt {'succeeded' if success1 else 'failed'} (reward={reward1:.2f})."
+                parts = [result_str]
+                feedback_str = format_reward_feedback(sim1.reward_info)
+                if feedback_str:
+                    parts.append(feedback_str)
+                gt_str = format_ground_truth(task)
+                if gt_str:
+                    parts.append(gt_str)
+                feedback_message = "\n".join(parts)
+
+                now = datetime.now()
+                remember_str = (
+                    f"[REMEMBER] The time is {now.strftime('%Y-%m-%d %H:%M:%S')}. "
+                    f"Use your memory tools to save what you think is important: "
+                    f"memory_store to save a new memory, "
+                    f"memory_recall to search existing memories, "
+                    f"memory_forget to remove outdated ones."
+                )
+                full_message = f"[EVALUATION RESULT]\n{feedback_message}\n\n\n{remember_str}"
+                print(f"  [feedback → session {session_id}]\n    " + feedback_message.replace("\n", "\n    "))
+                _call_openclaw(session_id, full_message, use_gateway=use_gateway, agent_id=agent_id)
+                print()
+
+                tokens_after = count_session_tokens(agent_id)
+                task_tokens = {
+                    "input": tokens_after["input"] - tokens_before["input"],
+                    "output": tokens_after["output"] - tokens_before["output"],
+                    "totalTokens": tokens_after["totalTokens"] - tokens_before["totalTokens"],
+                }
+                results.append({
+                    "task_id": task.id,
+                    "run1_reward": reward1,
+                    "run1_success": success1,
+                    "tokens": task_tokens,
+                })
         except Exception as e:
             print(f"  [ERROR] Task {task.id} failed, skipping: {e}")
 
@@ -285,15 +405,21 @@ def main():
 
     # --- Summary ---
     n = len(results)
-    r1_avg = sum(r["run1_reward"] for r in results) / n
-    r1_pass = sum(r["run1_success"] for r in results) / n
-
-    print("=" * 50)
-    print(f"[Train Summary]  {n} tasks  domain={args.domain}  split={split}")
-    print(f"  avg_reward={r1_avg:.3f}  pass_rate={r1_pass:.3f}")
-    print()
-    token_stats = count_session_tokens(agent_id)
-    print(f"  Token usage (accumulated):  input={token_stats['input']:,}  output={token_stats['output']:,}  total={token_stats['totalTokens']:,}")
+    if use_openviking:
+        avg_rewards = [r.get("avg_reward", 0) for r in results]
+        pass_rates = [r.get("pass_rate", 0) for r in results]
+        print("=" * 50)
+        print(f"[Train Summary]  {n} tasks  domain={args.domain}  split={split}  backend=openviking  runs_per_task={num_runs}")
+        print(f"  avg_reward={sum(avg_rewards)/n:.3f}  pass_rate={sum(pass_rates)/n:.3f}")
+    else:
+        r1_avg = sum(r["run1_reward"] for r in results) / n
+        r1_pass = sum(r["run1_success"] for r in results) / n
+        print("=" * 50)
+        print(f"[Train Summary]  {n} tasks  domain={args.domain}  split={split}  backend=lancedb")
+        print(f"  avg_reward={r1_avg:.3f}  pass_rate={r1_pass:.3f}")
+        print()
+        token_stats = count_session_tokens(agent_id)
+        print(f"  Token usage (accumulated):  input={token_stats['input']:,}  output={token_stats['output']:,}  total={token_stats['totalTokens']:,}")
     print()
     print("Memory accumulated. Now run:")
     print(f"  python run_eval.py --domain {args.domain} --task-split test")
